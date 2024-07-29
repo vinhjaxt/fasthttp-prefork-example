@@ -3,52 +3,82 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
+	"os"
+	"strings"
 
 	"github.com/valyala/fasthttp"
-	fastprefork "github.com/valyala/fasthttp/prefork"
 )
 
-var (
-	fasthttpListen  string
-	fasthttpPrefork bool
-)
-
-func init() {
-	flag.StringVar(&fasthttpListen, `l`, `:8080`, `Listen address`)
-	flag.BoolVar(&fasthttpPrefork, `prefork`, false, `Use prefork http`)
-
-	flag.Parse()
-}
+var listen = flag.String(`l`, `:80`, `HTTP Listen address`)
+var prefork = flag.Bool(`prefork`, false, `Prefork`)
 
 func main() {
-	isNotPreforkOrIsChild := !fasthttpPrefork || fastprefork.IsChild()
-	handler := func(ctx *fasthttp.RequestCtx) {}
+	flag.Parse()
 
-	if isNotPreforkOrIsChild {
-		// init database
+	// Server
+	var err error
+	var ln net.Listener
+	var fd *os.File
 
-		// init handler
-		handler = requestHandler
+	if !*prefork || !PreforkIsChild() {
+		log.Println(`[master] init listener`)
+		// master or not prefork
+		if strings.HasPrefix(*listen, `unix:`) {
+			unixFile := (*listen)[5:]
+			os.Remove(unixFile)
+			ln, err = net.Listen(`unix`, unixFile)
+			os.Chmod(unixFile, os.ModePerm)
+			if ln != nil {
+				log.Println(`[master] listening:`, unixFile)
+				fln := ln.(*net.UnixListener)
+				fd, err = fln.File()
+			}
+		} else {
+			ln, err = net.Listen(`tcp`, *listen)
+			if ln != nil {
+				log.Println(`[master] listening:`, ln.Addr().String())
+				fln := ln.(*net.TCPListener)
+				fd, err = fln.File()
+			}
+		}
+		if err != nil {
+			log.Panicln(err)
+		}
+		if ln == nil {
+			log.Panicln(`[master] error listening:`, *listen)
+		}
 	}
 
-	// init fasthttp server
-	server := &fasthttp.Server{
-		Name:    ``,
-		Handler: handler,
+	srv := &fasthttp.Server{
+		Name:               `nginx`,
+		Handler:            requestHandler,
+		MaxRequestBodySize: 200 * 1024 * 1024, // 200 MB
 	}
 
-	listenAndServe := server.ListenAndServe
-	if fasthttpPrefork {
-		listenAndServe = fastprefork.New(server).ListenAndServe
+	if !*prefork {
+		log.Println(`[master] single process serving`)
+		log.Panicln(srv.Serve(ln))
 	}
 
-	log.Println(`Listen`, fasthttpListen)
-	err := listenAndServe(fasthttpListen)
-	if err != nil {
-		log.Panicln(err)
+	if PreforkIsChild() {
+		// child
+		ln, err = PreforkGetListenerFd()
+		if err != nil {
+			log.Panicln(`[child] listener:`, err)
+		}
+		log.Println(`[child] running`)
+		log.Panicln(srv.Serve(ln))
+	} else {
+		// master
+		if fd == nil {
+			log.Panicln(`[master] listen error, fd = nil`)
+		}
+		log.Println(`[master] prefork`)
+		log.Panicln(Prefork([]*os.File{fd}, 0))
 	}
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
-	ctx.SetBodyString(`Hello world`)
+	ctx.Response.SetBodyString(`Hello world`)
 }
